@@ -1,0 +1,746 @@
+---
+title: "Analiza Spektralna - projekt zaliczeniowy"
+author: "Aleksander Potok"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+    toc_depth: 4
+    code_folding: show
+---
+
+```{r message=F, warning = F}
+library(ggplot2)
+library(tidyverse)
+library(patchwork)
+library(lomb)
+library(moments)
+library(knitr)
+library(oce)
+library(fracdiff)
+library(forecast)
+library(astsa)
+library(mFilter)
+col <- "#2c3e50"
+col2 <- "#18bc9c"
+```
+
+# Zadanie 1. - Analiza widmowa rzeczywistych szeregów czasowych
+
+Zbiór danych pochodzi ze strony https://kp.gfz.de/en/data i zawiera historyczne pomiary aktywności geomagnetycznej Ziemi, która jest bezpośrednio skorelowana z występowaniem zórz polarnych. Analiza obejmuje okres od 1 stycznia 2018r. do końca 2025 roku. Jest to krótszy okres niż pełny cykl aktywności słonecznej (ok. 11 lat), jednak jest to zabieg celowy - w tej analizie skupimy się na częstszych cyklach, traktując pełny cykl aktywności słonecznej jako trend. Zestaw danych zawiera obserwacje o częstotliwości 3 godzinnej i obejmuje m.in.: *Indeks Kp* - indeks aktywności geomagnetycznej i *Indeks Ap*, który jest przeliczeniem indeksu Kp na skalę liniową. W tej analizie zajmiemy się średnią dzienną wartością Ap.
+
+```{r}
+data <- read.csv("kp.csv", sep = ";", header = F)
+dates <- as.Date(paste(data[,1], data[,2],data[,3], sep="-"))
+ap <- data$V24
+start_year <- as.numeric(format(dates[1], "%Y"))
+start_day  <- as.numeric(format(dates[1], "%j"))
+xts <- ts(ap, frequency = 365, start = c(start_year, start_day))
+```
+
+```{r}
+ggplot(data.frame(Time = as.numeric(time(xts)), Ap = as.numeric(xts)), aes(x = Time, y = Ap)) +
+  geom_line(color = col) +
+  labs(title = "Aktywność geomagnetyczna (Indeks Ap)", 
+       y = "Wartość indeksu Ap", x = "Czas") +
+  theme_bw()
+```
+
+## Przygotowanie danych
+
+### Rozkład aktywności geomagnetycznej (Indeks Ap)
+
+```{r}
+stat_opisowe <- data.frame(
+  "Średnia" = mean(xts),
+  "Odch. stand." = sd(xts),
+  "Wsp. skośności" = skewness(xts),
+  "Kurtoza" = moments::kurtosis(xts),
+  "Min" = min(xts),
+  "Q1" = quantile(xts)[2],
+  "Mediana" = median(xts),
+  "Q3" = quantile(xts)[4],
+  "Max" = max(xts),
+  row.names = "Wartość"
+)
+
+kable(t(round(stat_opisowe,4)))
+```
+
+
+```{r}
+p1 <- ggplot(data.frame(Time = as.numeric(time(xts)), Ap = as.numeric(xts)), aes(x = Ap)) +
+  geom_histogram(bins=100,fill = col ,color="white") +
+  labs(title = "Rozkład aktywności geomagnetycznej (Indeks Ap)", 
+       y = "Częstość", x = "") +
+  theme_bw()
+
+p2 <- ggplot(data.frame(Time = as.numeric(time(xts)), Ap = as.numeric(xts)), aes(y = "", x = Ap)) +
+  geom_boxplot(fill = "lightgrey", outlier.color = col, outlier.shape = 1) +
+  labs(, y="", x="Indeks Ap") +
+  theme_bw() 
+
+p1 / p2
+```
+
+Szereg nie jest stacjonarny, jego rozkład jest mocno skośny i istnieją obserwacje odstające. Zastosujemy logarytmizację w celu stabilizacji wariancji oraz usuniemy trend związany z pełnym cyklem aktywności słonecznej (trwającym 11 lat).
+
+```{r message=F}
+xts_log <- log(xts + 1)
+model <- loess(xts_log ~ time(xts_log), span = 0.5)
+xts_detrend <- residuals(model)
+
+ggplot(data.frame(xts_log = xts_log, time = time(xts_log), fitted = model$fitted), aes(x = time)) +
+  geom_line(aes(y = xts_log), col="lightgrey") +
+  geom_line(aes(y = fitted), col=col, linewidth = 1) +
+  labs(title = "Szereg zlogarytmowany z dopasowanym trendem LOESS", x = "Czas", y = "") +
+  theme_bw()
+
+mean(xts_detrend)
+```
+
+Średnia po usunięciu trendu nie jest równa zero (funkcja LOESS nie działa jak klasyczna regresja, gdzie reszty są równe zero), dlatego stosujemy jeszcze centrowanie danych.
+
+```{r message=F}
+xts <- xts_detrend - mean(xts_detrend)
+xts <- ts(xts[1:(length(xts) - 2)], frequency = 365, start = c(start_year, start_day))
+
+ggplot(data.frame(xts = xts, time = time(xts)), aes(x = time, y = xts)) +
+  geom_line(col="lightgrey") +
+  labs(title = "Szereg scentrowany", x = "Czas", y = "") +
+  theme_bw()
+
+```
+
+
+## 1. Analiza podstawowa
+
+### Periodogram dla danych oryginalnych (zlogarytmowanych) i scentrowanych
+
+```{r warning=F}
+n <- 2920
+m <- floor(n/2)
+fourier_log <- fft(xts_log[1:n])
+fourier_log <- fourier_log[2:(m+1)]
+
+y_log <- (1/(2*pi*n))* (Mod(fourier_log))^2
+f <- (1:m)/n
+
+#dane scentrowane
+fourier <- fft(xts[1:2920])
+fourier <- fourier[2:(m+1)]
+
+y <- (1/(2*pi*n))* (Mod(fourier))^2
+
+ggplot(data.frame(f = f, y=y, y_log = y_log), aes(x = f)) +
+  geom_line(aes(y = y_log, color = "Dane oryginalne"), linewidth = 0.7) +
+  geom_line(aes(y = y, color = "Dane scentrowane"), linewidth = 0.3) +
+  scale_color_manual(values = c("Dane oryginalne" = col, 
+                                "Dane scentrowane" = col2)) +
+  labs(title = "Periodogram: Dane oryginalne i scentrowane", x = "Czas", y = "", color = "") +
+  coord_cartesian(ylim = c(0, 13)) +
+  theme_bw() +
+  theme(legend.position = c(0.85, 0.85), legend.background = element_rect(fill = "white", color = "black", linewidth = 0.2))
+
+ggplot(data.frame(f = f, y=y, y_log = y_log), aes(x = f)) +
+  geom_line(aes(y = y_log, color = "Dane oryginalne"), linewidth = 1) +
+  geom_line(aes(y = y, color = "Dane scentrowane"), linewidth = 1) +
+  scale_color_manual(values = c("Dane oryginalne" = col, 
+                                "Dane scentrowane" = col2)) +
+  labs(title = "Periodogram: Dane oryginalne i scentrowane (Zbliżenie)", x = "Czas", y = "", color = "") +
+  coord_cartesian(xlim = c(0, 0.02), ylim = c(0, 13)) +
+  theme_bw() +
+  theme(legend.position = c(0.85, 0.85), legend.background = element_rect(fill = "white", color = "black", linewidth = 0.2))
+```
+
+W przypadku danych oryginalnych (kolor granatowy), widmo jest całkowicie zdominowane przez energię skupioną przy częstotliwości zerowej. 
+
+### N podzielne przez 365 i N niepodzielne 
+
+```{r}
+n <- 2920
+n2 <- 2900
+m <- floor(n/2)
+m2 <- floor(n2/2)
+fourier_p <- fft(xts_log[1:n])
+fourier_p <- fourier_p[2:(m+1)]
+fourier_np <- fft(xts_log[1:n2])
+fourier_np <- fourier_np[2:(m2+1)]
+
+y_p <- (1/(2*pi*n))* (Mod(fourier_p))^2
+y_np <- (1/(2*pi*n2))* (Mod(fourier_np))^2
+f2 <- (1:m2)/n2
+
+
+df_p <- data.frame(freq = f, spec = y_p, type = "N=2920 (podzielne)")
+df_np <- data.frame(freq = f2, spec = y_np, type = "N=2900 (niepodzielne)")
+df_combined <- rbind(df_p, df_np)
+
+ggplot(df_combined, aes(x = freq, y = spec, color = type)) +
+  geom_line(linewidth = 0.7, alpha = 0.8) +
+  scale_color_manual(values = c("N=2920 (podzielne)" = col, 
+                                "N=2900 (niepodzielne)" = col2)) +
+  labs(title = "Periodogram w zależności od liczby obserwacji", 
+       x = "Częstotliwość f", y = "Moc", color = "Liczba obserwacji N") +
+  theme_bw() +
+  theme(legend.position = c(0.8, 0.8), 
+        legend.background = element_rect(fill = "white", color = "black", linewidth = 0.2))
+
+ggplot(df_combined, aes(x = freq, y = spec, color = type)) +
+  geom_line(linewidth = 1, alpha = 0.8) +
+  scale_color_manual(values = c("N=2920 (podzielne)" = col, 
+                                "N=2900 (niepodzielne)" = col2)) +
+  coord_cartesian(xlim = c(0.0025, 0.01), ylim = c(0, 2.5)) +
+  labs(title = "Periodogram: Wyciek widma (Zbliżenie)", 
+       x = "Częstotliwość f", y = "Moc", color = "Liczba obserwacji N") +
+  theme_bw() +
+  theme(legend.position = c(0.8, 0.8), 
+        legend.background = element_rect(fill = "white", color = "black", linewidth = 0.2))
+```
+
+Skupiając się na trendzie półrocznym widzimy, że pik przy częstotliwości 0,0055 (182,5 dnia) jest węższy i wyższy dla N podzielnego przez 365. W przypadku N niepodzielnego przez 365 dochodzi do zjawiska wycieku widma, co widać na wykresie - pik jest niższy, a podstawa szersza. Analizując inne trendy nie obserwujemy tak silnego zjawiska, ponieważ są one naturalnie rozmyte (przykładowo aktywność Słońca trwa między 25 a 30 dni)
+
+```{r}
+d <- 1/f
+kable(slice_max(data.frame(Częstotliwość = f, Wartość = y, Dni = d), order_by = y, n=10))
+```
+
+
+## 2. Porównanie metod
+
+Od teraz korzystamy tylko z danych scentrowanych po usunięciu trendu.
+
+### Periodogram naiwny wyznaczony z definicji z 95% przedziałem ufności
+
+```{r}
+m <- floor(n/2)
+f <- (1:m)/n
+fourier <- fft(xts)
+fourier <- fourier[2:(m+1)]
+y <- (1/(2*pi*n))* (Mod(fourier))^2
+cl <- (2 * y) / qchisq(1 - 0.025, df=2)
+cu <- (2 * y) / qchisq(0.025, df=2)
+  
+plot_sur <- ggplot(data.frame(f = f, y=y), aes(x = f, y = y)) +
+  geom_line(col = col, linewidth = 0.8) +
+  labs(
+    x = "Częstotliwość", 
+    y = " ",
+    title = "Periodogram naiwny"
+  ) +
+  theme_bw()
+
+ggplot(data.frame(f = f, y=y, cl = cl, cu = cu), aes(x = f)) +
+  geom_ribbon(aes(ymin = cl, ymax = cu), fill = "lightgrey") +
+  geom_line(aes(y = y), col = col, linewidth = 0.5) +
+  scale_y_log10() +
+  labs(
+    x = "Częstotliwość", 
+    y = "Wartość (skala logarytmowana)",
+    title = "Periodogram naiwny z 95% przedziałem ufności"
+  ) +
+  theme_bw()
+```
+
+### Periodogram metodą Welcha
+
+```{r}
+p_welch <- pwelch(xts, plot = F)
+p_welch$f <- p_welch$freq / 365
+
+plot_welch <- ggplot(data.frame(f = p_welch$f, y=p_welch$spec), aes(x = f, y = y)) +
+  geom_line(col = col, linewidth = 0.8) +
+  labs(
+    x = "Częstotliwość", 
+    y = " ",
+    title = "Periodogram metodą Welcha"
+  ) +
+  theme_bw()
+plot_welch
+```
+
+### Periodogramy wygładzone oknem Daniella
+
+```{r}
+p_dan1 <- spec.pgram(
+  xts,
+  kernel = kernel("daniell", m = 5),
+  taper = 0,
+  detrend = F,
+  demean = F,
+  fast = F,
+  plot = F
+)
+
+p_dan2 <- spec.pgram(
+  xts,
+  kernel = kernel("daniell", m = c(3, 5)),
+  taper = 0,
+  detrend = F,
+  demean = F,
+  fast = F,
+  plot = F
+)
+
+p_dan1$f <- p_dan1$freq / 365
+p_dan2$f <- p_dan2$freq / 365
+
+plot_dan_1 <- ggplot(data.frame(f = p_dan1$f, y=p_dan1$spec), aes(x = f, y = y)) +
+  geom_line(col = col, linewidth = 0.8) +
+    labs(
+    x = "Częstotliwość", 
+    y = " ",
+    title = "Periodogram wygładzony oknem Daniella (okno jednopoziomowe)"
+  ) +
+  theme_bw()
+
+plot_dan_2 <- ggplot(data.frame(f = p_dan2$f, y=p_dan2$spec), aes(x = f, y = y)) +
+  geom_line(col = col, linewidth = 0.8) +
+    labs(
+    x = "Częstotliwość", 
+    y = " ",
+    title = "Periodogram wygładzony oknem Daniella (okno wielopoziomowe)"
+  ) +
+  theme_bw()
+
+plot_dan_1 / plot_dan_2
+```
+
+### Periodogram wygładzony poprzez 5 rozłącznych podokresów
+
+```{r}
+K <- 5
+L <- floor(2920 / K)
+
+data_matrix <- matrix(xts[1:(L*K)], nrow = L, ncol = K)
+
+
+p_bartlett_temp <- spec.pgram(data_matrix[,1], taper=0, detrend = F, demean = F, plot=F)
+avg_spec <- p_bartlett_temp$spec
+
+for(i in 2:K) {
+  avg_spec <- avg_spec + spec.pgram(data_matrix[,i], taper=0, detrend = F, demean = F, plot=F)$spec
+}
+
+avg_spec <- avg_spec / K
+p_bartlett <- p_bartlett_temp
+p_bartlett$spec <- avg_spec
+
+plot_bartlett <- ggplot(data.frame(f = p_bartlett$freq, y=p_bartlett$spec), aes(x = f, y = y)) +
+  geom_line(col = col, linewidth = 0.8) +
+    labs(
+    x = "Częstotliwość", 
+    y = " ",
+    title = "Periodogram wygładzony przez rozłączne podokresy"
+  ) +
+  theme_bw()
+plot_bartlett
+```
+
+### Porównanie periodogramów
+
+```{r fig.width=14, fig.height=10}
+empty <- ggplot() + theme_void()
+(plot_sur + plot_welch) / (plot_dan_1 + plot_dan_2) / (plot_bartlett + empty)
+```
+
+Periodogram naiwny wykazuje największą wariancję. Dzięki temu jego piki są bardzo wąskie, jednak zwiększa to ilość szumu przez co jest mniej czytelny. Periodogram wyznaczony metodą Welcha radzi sobie dobrze z usuwaniem szumu tła, nie rozmywając sygnału na boki. W przypadku periodogramów wygładzonych metodą Daniella piki są zdecydowanie szersze. Szczególnie widać to w przypadku okna wielopoziomowego. Dla periodogramu wygładzonego przez rozłączne podokresy szerokość piku jest wąska, natomiast wariancja jest zdecydowanie większa niż w przypadku Welcha i Daniella. 
+
+## 3. Analiza danych niekompletnych
+
+```{r warning=F}
+n <- length(xts)
+idx <- sample(1:n, size = round(0.3 * n))
+xts_NA <- xts
+xts_NA[idx] <- NA
+
+xts_NAomit <- na.omit(as.numeric(xts_NA))
+
+p_naiwny_NA <- spec.pgram(
+  xts_NAomit,
+  log = "no",
+  detrend = FALSE,
+  demean = FALSE,
+  plot = FALSE,
+)
+
+p1_NA <- ggplot(data_frame(f = p_naiwny_NA$freq, s = p_naiwny_NA$spec), aes(f, s)) +
+  geom_line(col = col, linewidth = 0.6) +
+  labs(title = "Periodogram naiwny dla danych niekompletnych", 
+       x = "Częstotliwość", y = " ") +
+  theme_bw()
+
+ls <- lsp(xts_NA, type = "frequency", alpha = 0.05, plot = F, from = 0, to = 0.5)
+p2_NA <- ggplot(data_frame(f = ls$scanned, s = ls$power), aes(f, s)) +
+  geom_line(col = col, linewidth = 0.6) +
+  geom_hline(yintercept = ls$sig.level, color = "red", linetype = "dashed") +
+  labs(title = "Periodogram Lomba–Scargle’a", 
+       x = "Częstotliwość", y = " ") +
+  theme_bw()
+  
+p1_NA / p2_NA
+```
+
+Po usunięciu 30% obserwacji periodogram Lomba-Scargle'a poradził sobie lepiej niż periodogram naiwny. Przede wszystkim mimo braków w danych udało mu się odwzorować dwa najważniejsze piki związane z okresem półrocznym i trwającym ok. 27 dni. W przypadku periodogramu naiwnego, trend półroczny został odwzorowany poprawnie, jednak 27-dniowy jest rozmyty i zdecydowanie niższy niż powinien być.
+
+# Zadanie 2. Portfolio Zadań
+
+## Zestaw 1.
+
+### Zadanie 4.
+
+```{r}
+t <- 1:300
+x <- rnorm(300, 0, 0.1)
+y <- sin(t/20) + x
+v20 <- rep(1/20, 20)
+v21 <- rep(1/21, 21)
+
+plot(t, y, type = "l")
+y_lag20 <- stats::filter(y, v20, sides=1)
+lines(t, y_lag20, col="red")
+y_lag21_centr <- stats::filter(y, v21, sides=2)
+lines(t, y_lag21_centr, col="blue")
+```
+
+Średnie ruchome w skuteczny sposób usunęły szum i w odwzorowały trend okresowy. Średnia jednostrona składająca się z 20 obserwacji (kolor czerwony) wykazuje opóźnienie (przesunięcie fazowe) względem oryginału. W przypadku scentrowanej średniej ruchomej (kolor niebieski), jej wartości idealnie pokrywają się z fazą sygnału.
+
+
+### Zadanie 5.
+
+```{r}
+pkb <- read.csv("pkb.csv", sep=";")
+plot(pkb$PKB, type = "l")
+mv2 <- c(0.25, 0.5, 0.25)
+y2 <- stats::filter(pkb$PKB, mv2, sides=2)
+lines(y2, col="red")
+
+mv3 <- c(1/3, 1/3, 1/3)
+y3 <- stats::filter(pkb$PKB, mv3, sides=2)
+lines(y3, col="blue")
+
+mv4 <- c(1/8, 1/4, 1/4, 1/4, 1/8)
+y4 <- stats::filter(pkb$PKB, mv4, sides=2)
+lines(y4, col="green4")
+
+mv5 <- c(1/5, 1/5, 1/5, 1/5, 1/5)
+y5 <- stats::filter(pkb$PKB, mv5, sides=2)
+lines(y5, col="orange")
+```
+
+Średnie ruchome rzędu 2 i 3 (czerwona i niebieska) wciąż podążają za sezonowymi wahaniami, nie eliminując ich całkowicie. Dopiero zastosowanie wag rzędu 4 (kolor zielony) pozwala na skuteczne odsezonowanie danych, co sugeruje cykl okresowości kwartalny. Jednocześnie przez wyższy rząd średniej ruchomej tracimy informację o dynamice zjawiska na końcach szeregu przez skracanie się wektora wyników. Średnia rzędu 5 nie radzi sobie najlepiej - pojawiają się sztuczne oscylacje w miejscu, w którym nie powinny.
+
+### Zadanie 9.
+
+```{r}
+ozon <- read.csv("ozon.csv", sep=" ")
+x <- 1:200
+y <- ozon[1:200,]
+plot(x,y)
+model <- lm(y ~ sin(2*x)+cos(2*x)+
+              sin(3*x)+cos(3*x)+
+              sin(4*x)+cos(4*x)+
+              sin(5*x)+cos(5*x)+
+              sin(6*x)+cos(6*x)+
+              sin(7*x)+cos(7*x)+
+              sin(8*x)+cos(8*x)+
+              sin(9*x)+cos(9*x))
+y2 <- predict(model)
+plot(x, y, type="l")
+lines(y2, col="blue")
+
+
+xnam <- paste0("sin(x*", 1:50,") + cos(x*", 1:50, ")")
+fmla <- as.formula(paste("y ~ ", paste(xnam, collapse= "+")))
+model2 <- lm(fmla)
+
+y3 <- predict(model2)
+lines(y3, col="red")
+```
+
+W przypadku dopasowania kombinacji harmonik sinusoidalnych o częstotliwościach k = 2,...9 (kolor niebieski) model dobrze wyłapuje ogólny rytm sezonowy jednak niedoszacowuje ekstremów. W przypadku modelu składającego się z 50 harmonik, model dopasowuje się zdecydowanie lepiej do danych, jednak niesie ze sobą ryzyko nadmiernego dopasowania (overfitting), przez co jakość prognozy poza próbą może być średniej jakości.
+
+## Zestaw 2.
+
+### Zadanie 5.
+
+```{r}
+pkb <- read.csv("pkb.csv", sep=";")
+n <- 45
+pkb <- pkb[1:n,]
+m <- floor(n/2)
+fourier <- fft(pkb$PKB_detrended)
+fourier <- fourier[2:(m+1)]
+
+#periodogram
+y <- (1/(2*pi*n))* (Mod(fourier))^2
+f <- (1:m)/n
+
+n2 <- 44
+pkb2 <- pkb[1:n2,]
+m2 <- floor(n2/2)
+fourier2 <- fft(pkb2$PKB_detrended)
+fourier2 <- fourier2[2:(m2+1)]
+
+#periodogram
+y2 <- (1/(2*pi*n2))* (Mod(fourier2))^2
+f2 <- (1:m2)/n2
+
+plot(f, y, type="l", col="blue", ylim= c(0, max(y2)))
+lines(f2, y2, type="l", col="red")
+abline(v=0.25, col="red", lty=3)
+legend("topleft", legend=c("N=45 (niepodzielne)", "N=44 (podzielne)"), 
+       col=c("blue", "red"), lty=1)
+```
+
+Dla N = 44, czyli podzielnego przez 4, pik sezonowy przypada dokładnie na częstotliwość 0,25. Dodatkowo pojawia się pik dla częstotliwości 0,5, który jest cyklem półrocznym, będącym wielokrotnością cyklu podstawowego. Badając dla N = 45, niepodzielnego przez 4, dochodzi do zjawisku wycieku widma. Widmo rozlewa się do sąsiednich częstotliwości przez co główny pik jest szerszy i niższy. 
+
+```{r}
+f[which.max(y)]
+f2[which.max(y2)]
+f2[which.max(y2[1:21])]
+```
+
+
+### Zadanie 6.
+
+```{r}
+sp500 <- read.csv("sp500.csv", sep=";")
+sp500$RETURN <- as.numeric(sub("%", "", sp500$RETURN))
+
+n <- length(sp500$RETURN)
+m <- floor(n/2)
+fourier <- fft(sp500$RETURN)
+fourier <- fourier[2:(m+1)]
+
+#periodogram
+y <- (1/(2*pi*n))* (Mod(fourier))^2
+f <- (1:m)/n
+px <- ((1:6)/12)
+py <- y[which(px==f)]
+
+
+plot(f, y, type="l")
+lines(px, py, type="p", col="red")
+abline(v=px, col="red", lty=3)
+```
+
+Na periodogramie stóp zwrotu indeksu S&P 500 nie widać wyraźnych i dominujących pików. Częstotliwości 1/12, 2/12 itd. zaznaczone na czerwono nie wystają ponad przeciętny poziom szumu, co oznacza, że w danych miesięcznym składnik sezonowy jest nieistotny.
+
+### Zadanie 8.
+
+```{r}
+t <- seq(0, 0.296, by=0.001)
+yt <- cos(2*pi*200*t) + rnorm(length(t), 0, 1)
+yts <- ts(yt, frequency=1000)
+yts <- yts - mean(yts)
+
+#periodogram naiwny
+p_naiwny <- spec.pgram(yts, detrend = T, taper= 0, plot=F)
+
+#periodogram wygładzony oknem Daniella
+p_daniell <- spec.pgram(yts, kernel("daniell", 3), taper = 0, detrend = F, plot = F)
+
+#periodogram Welcha
+p_welch <- pwelch(yts, noverlap = 10, plot = F)
+
+plot(p_welch$freq, p_welch$spec, type ="l", ylim=c(0,0.02), col="red")
+lines(p_naiwny$freq, p_naiwny$spec, col = "grey")
+lines(p_daniell$freq, p_daniell$spec, col = "blue")
+legend("topright", legend=c("Periodogram metodą Welcha", "Periodogram wygładzony oknem Daniella"), 
+       col=c("red","blue"), lty=1)
+```
+
+Periodogram naiwny (kolor szary) charakteryzuje się największą wariancją. Periodogram wyznaczony metodą Welcha skutecznie wygładza szum tła i dodatkowo dobrze radzi sobie z pikiem. Periodogram wygładzony oknem Daniella charakteryzuje się szerokim i płaskim wierzchołkiem oraz bardzo stromymi krawędziami.
+
+## Zestaw 3.
+
+### Zadanie 8
+
+```{r}
+x <- fracdiff.sim(1000, ar = 0.1, ma = -0.4, d=0.4)$series
+fit <- arfima(x)
+tsdisplay(residuals(fit))
+```
+
+Reszty oscylują wokół zera. Brak istotnej autokorelacji.
+
+
+Prognoza punktowa i przedziałowa
+```{r}
+f_arfima <- forecast(fit, h=100)$mean
+```
+
+Arima
+```{r}
+fit_arima <- auto.arima(x)
+f_arima <- forecast(fit_arima, h=100)$mean
+```
+
+Porównanie
+
+```{r}
+par(mfrow = c(1,2)) 
+plot(forecast(fit, h=100))
+plot(forecast(fit_arima, h=100))
+par(mfrow = c(1,1))
+```
+
+Model ARFIMA z parametrem d = 0,4 wykazuje cechy długiej pamięci, a wpływ dawnych obserwacji wygasa powoli. Linia prognozy staje się płaska i widać na niej pamięć ostatnich obserwacji. Przedziały ufności są stabilne i rozszerzają się bardzo powoli. Natomiast model ARIMA szybko wraca do średniej, a przedziały ufności rozszerzają się gwałtownie.
+
+### Zadanie 12.
+
+```{r warning=F}
+df <- read.csv("infl_bezr.csv", sep=";")
+xts <- ts(data = df$BEZR, frequency = 12)
+xts <- xts - mean(xts)
+
+cf <- mFilter::cffilter(xts, pl=3, pu=72)$cycle
+cf2 <- mFilter::cffilter(xts, pl=6, pu=72)$cycle
+hp <- mFilter::hpfilter(xts, type = "frequency", freq = 12)$cycle
+
+
+p_raw <- spec.pgram(xts, taper = 0, pad=0, fast=F, detrend = F, plot=F)
+p_cf  <- spec.pgram(cf,  taper = 0, pad=0, fast=F, detrend = F, plot=F)
+p_cf2 <- spec.pgram(cf2, taper = 0, pad=0, fast=F, detrend = F, plot=F)
+p_hp  <- spec.pgram(hp,  taper = 0, pad=0, fast=F, detrend = F, plot=F)
+
+par(mfrow = c(2,2)) 
+plot(p_raw, main="Periodogram: Szereg oryginalny")
+plot(p_cf,  main="Periodogram: Filtr CF (3-72)")
+plot(p_cf2, main="Periodogram: Filtr CF (6-72)")
+plot(p_hp,  main="Periodogram: Filtr HP")
+par(mfrow = c(1,1))
+```
+
+
+```{r}
+transfer_f_cf  <- p_cf$spec  / p_raw$spec
+transfer_f_cf2 <- p_cf2$spec / p_raw$spec
+transfer_f_hp  <- p_hp$spec  / p_raw$spec
+
+freq <- p_raw$freq
+
+plot(freq, transfer_f_cf, col="blue", type="l", lwd=2,
+     xlab="Częstotliwość", ylab=" ")
+lines(freq, transfer_f_cf2, col="red", lwd=2)
+lines(freq, transfer_f_hp,  col="green", lwd=2)
+legend("topleft", legend=c("CF (3-72)", "CF (6-72)", "HP"),
+       col=c("blue", "red", "green"), lty=1, lwd=2, bty="n")
+```
+
+Filtr CF (3-72) (kolor niebieski) przyjmuje najwyższe wartości dla częstotliwości do około 4, a następnie gwałtownie spada. Oznacza to, że filtr ten przepuszcza głównie średnie częstotliwości, a silnie tłumi zarówno trend jak i szum. W efekcie zachowuje jedynie wahania odpowiadające cyklom koniunkturalnym. Filtr CF (6-72) (kolor czerwony) przyjmuje wysokie wartości do częstotliwości około 2, po czym szybko zbliża się do zera. Oznacza, to że usuwa on jeszcze więcej krótkookresowowych wahań i koncentruje się tylko na wolniejszych cyklach. W przypadku filtra HP (kolor zielony) wartości rosną dla wyższych częstotliwości - filtr HP nie eliminuje szybkich wahań, a nawet częściowo je wzmacnia.
+
+## Zestaw 4.
+
+### Zadanie 1.
+
+```{r}
+AirPassengers <- log(AirPassengers)
+
+sarima(AirPassengers, 0, 1, 1, 0, 1, 1, 12)
+sarima.for(xdata = AirPassengers, 12, 0, 1, 1, 0, 1, 1, 12)
+```
+
+```{r}
+x <- diff(log(AirPassengers))
+
+cf  <- cffilter(x, pl = 3, pu = 72)$cycle
+hp  <- hpfilter(x, type = "frequency", freq = 12)$cycle
+
+p_raw <- spec.pgram(x,  taper = 0, pad = 0, fast = FALSE, detrend = FALSE, plot = FALSE)
+p_cf  <- spec.pgram(cf, taper = 0, pad = 0, fast = FALSE, detrend = FALSE, plot = FALSE)
+p_hp  <- spec.pgram(hp, taper = 0, pad = 0, fast = FALSE, detrend = FALSE, plot = FALSE)
+
+plot(p_raw$freq, p_raw$spec, type="l", main="Widma: oryginał vs filtracja", lwd = 2)
+lines(p_cf$freq, p_cf$spec, col="blue", lwd = 1)
+lines(p_hp$freq, p_hp$spec, col="green", lwd = 1)
+legend("topright",
+       legend=c("Oryginał", "CF", "HP"),
+       col=c("black","blue","green"),
+       lwd = 1, bty="n")
+```
+
+Podobnie jak w przypadku poprzedniego zadania filtr CF zachowuje wybrane składowe cykliczne, natomiast HP przepuszcza znaczną częśc szumu o wysokiej częstotliwości.
+
+```{r}
+transfer_cf <- p_cf$spec / p_raw$spec
+transfer_hp <- p_hp$spec / p_raw$spec
+freq <- p_raw$freq
+
+plot(freq, transfer_hp, type="l", col="blue", lwd=2,
+     xlab="Częstotliwość", ylab="Funkcja przenoszenia mocy")
+lines(freq, transfer_cf, col="green", lwd=2)
+legend("topright",
+       legend=c("HP", "CF"),
+       col=c("blue","green"),
+       lty=1, lwd=2, bty="n")
+```
+
+```{r}
+ker <- kernel("modified.daniell", 6)
+p_smooth <- kernapply(p_raw$spec, ker)
+
+freq_s <- freq[1:length(p_smooth)]
+
+plot(freq_s, p_smooth, type="l",
+     main="Wygładzony periodogram (Daniell)",
+     xlab="Częstotliwość", ylab="Widmo")
+```
+
+Dla niskich częstotliwości wartości widma są stosunkowo wysokie. Oznacza to, że w danych występują istotne wolne wahania o długim okresie. Następnie widoczny jest wyraźny spadek wartości widma, co wskazuje na silne tłumienie średnich częstotliwości.
+Dla wyższych częstotliwości widmo ponownie rośnie, jednak jego poziom pozostaje znacznie niższy niż osiągnięty dla niskich częstotliwości.
+
+### Zadanie 7.
+
+```{r}
+dane <- read.csv("infl_bezr.csv", sep=";")
+infl_ts <- ts(dane$INFL, frequency = 12, start = c(1, 1))
+bezr_ts <- ts(dane$BEZR, frequency = 12, start = c(1, 1))
+infl_d <- diff(infl_ts)
+bezr_d <- diff(bezr_ts)
+xts <- ts.intersect(infl_d, bezr_d)
+t <- time(infl_d)
+```
+
+```{r}
+p_raw <- spec.pgram(infl_d, plot = FALSE)
+p6 <- spec.pgram(infl_d, spans = 6, plot = FALSE)
+p8 <- spec.pgram(infl_d, spans = 8, plot = FALSE)
+omega <- 2 * pi * p_raw$freq
+
+plot(omega, p_raw$spec, type="l", col="gray", lwd=1,
+     main="Periodogram inflacji",
+     xlab="Częstotliwość (radiany)",
+     ylab="Gęstość widmowa")
+
+lines(2*pi*p6$freq, p6$spec, col="blue", lwd=2)
+lines(2*pi*p8$freq, p8$spec, col="red", lwd=2)
+
+legend("topright",
+       legend=c("surowy", "span=6", "span=8"),
+       col=c("gray","blue","red"),
+       lwd=c(1,2,2))
+```
+```{r}
+p <- spec.pgram(xts, spans = 6, taper=0, pad=0, fast=FALSE, plot = F)
+omega <- 2 * pi * p$freq
+plot(omega, p$coh, type="l",
+     xlab="Częstotliwość (radiany)",
+     ylab="Koherencja",
+     main="Koherencja inflacja–bezrobocie")
+```
+
+Koherencja przyjmuje najwyższe wartości dla niskich częstotliwości. Oznacza to, że inflacja i bezrobocie są umiarkowanie powiązane w długim okresie. 
+
+```{r}
+idx <- which.max(p$coh)
+phi <- p$phase[idx]
+omega <- 2 * pi * p$f[idx]
+tau <- phi / omega
+tau
+```
+
+Opóźnienie czasowe (tau) wynosi 0,6 roku, czyli około 7 miesięcy - bezrobocie reaguje z opóźnieniem na zmiany inflacji. 
